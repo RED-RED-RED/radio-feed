@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Radio Monitor</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #010409; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .wrap { background: #0d1117; border-radius: 12px; padding: 24px; font-family: ui-monospace, Menlo, Consolas, monospace; color: #c9d1d9; width: 100%; max-width: 640px; }
+  .header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; border-bottom: 1px solid #21262d; padding-bottom: 16px; }
+  .badge { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 4px 10px; font-size: 11px; color: #8b949e; letter-spacing: 0.08em; }
+  .title { font-size: 13px; font-weight: 500; color: #e6edf3; letter-spacing: 0.1em; flex: 1; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; box-shadow: 0 0 6px #3fb950; flex-shrink: 0; }
+  .status-dot.off { background: #f85149; box-shadow: 0 0 6px #f85149; }
+  .status-dot.connecting { background: #d29922; box-shadow: 0 0 6px #d29922; }
+  .viz-area { background: #010409; border-radius: 8px; border: 1px solid #21262d; height: 120px; margin-bottom: 16px; position: relative; overflow: hidden; }
+  canvas { width: 100%; height: 100%; display: block; }
+  .no-signal { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #484f58; letter-spacing: 0.15em; }
+  .controls { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .play-btn { width: 44px; height: 44px; border-radius: 50%; background: #238636; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: background 0.15s; }
+  .play-btn:hover { background: #2ea043; }
+  .play-btn.playing { background: #b62324; }
+  .play-btn.playing:hover { background: #da3633; }
+  .play-btn svg { width: 18px; height: 18px; fill: #fff; }
+  .vol-wrap { flex: 1; display: flex; align-items: center; gap: 10px; }
+  .vol-icon { color: #8b949e; font-size: 14px; flex-shrink: 0; }
+  input[type=range] { flex: 1; height: 4px; -webkit-appearance: none; appearance: none; background: #21262d; border-radius: 2px; outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #58a6ff; cursor: pointer; }
+  .vol-val { font-size: 11px; color: #8b949e; min-width: 28px; text-align: right; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+  .stat { background: #161b22; border: 1px solid #21262d; border-radius: 6px; padding: 10px 12px; }
+  .stat-label { font-size: 10px; color: #484f58; letter-spacing: 0.1em; margin-bottom: 4px; }
+  .stat-val { font-size: 14px; color: #e6edf3; font-weight: 500; }
+  .stat-val.green { color: #3fb950; }
+  .stat-val.amber { color: #d29922; }
+  .status-bar { display: flex; align-items: center; gap: 8px; font-size: 10px; color: #484f58; letter-spacing: 0.08em; border-top: 1px solid #21262d; padding-top: 12px; }
+  .stream-url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  audio { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <div class="status-dot off" id="dot"></div>
+    <span class="title">RADIO MONITOR</span>
+    <span class="badge" id="status-badge">OFFLINE</span>
+    <span class="badge">128 kbps</span>
+  </div>
+
+  <div class="viz-area">
+    <canvas id="viz"></canvas>
+    <div class="no-signal" id="no-signal">NO SIGNAL</div>
+  </div>
+
+  <div class="controls">
+    <button class="play-btn" id="play-btn" onclick="togglePlay()">
+      <svg id="play-icon" viewBox="0 0 24 24"><polygon points="5,3 19,12 5,21"/></svg>
+    </button>
+    <div class="vol-wrap">
+      <span class="vol-icon">&#9650;</span>
+      <input type="range" min="0" max="100" value="80" step="1" id="vol" oninput="setVol(this.value)">
+      <span class="vol-val" id="vol-val">80%</span>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-label">STATUS</div>
+      <div class="stat-val" id="stat-status" style="color:#484f58">IDLE</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">PEAK LEVEL</div>
+      <div class="stat-val" id="stat-peak" style="color:#484f58">---</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">UPTIME</div>
+      <div class="stat-val" id="stat-uptime">00:00:00</div>
+    </div>
+  </div>
+
+  <div class="status-bar">
+    <span class="stream-url" id="stream-url"></span>
+    <span id="clock">--:--:--</span>
+  </div>
+</div>
+
+<audio id="audio" crossorigin="anonymous"></audio>
+
+<script>
+// Uses whatever host you loaded the page from, so a MagicDNS name, a Tailscale IP, etc. all work.
+const STREAM_URL = 'http://' + location.hostname + ':8000/radio';
+let playing = false;
+let audioCtx, analyser, source, animFrame;
+let startTime = null;
+let uptimeInterval = null;
+
+const audio = document.getElementById('audio');
+const playBtn = document.getElementById('play-btn');
+const playIcon = document.getElementById('play-icon');
+const dot = document.getElementById('dot');
+const badge = document.getElementById('status-badge');
+const noSignal = document.getElementById('no-signal');
+const statStatus = document.getElementById('stat-status');
+const statPeak = document.getElementById('stat-peak');
+const statUptime = document.getElementById('stat-uptime');
+
+document.getElementById('stream-url').textContent = STREAM_URL;
+
+function setVol(v) {
+  audio.volume = v / 100;
+  document.getElementById('vol-val').textContent = v + '%';
+}
+
+function togglePlay() {
+  if (!playing) startStream(); else stopStream();
+}
+
+function startStream() {
+  playing = true;
+  dot.className = 'status-dot connecting';
+  badge.textContent = 'CONNECTING';
+  statStatus.textContent = 'CONNECTING';
+  statStatus.className = 'stat-val amber';
+  playIcon.innerHTML = '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>';
+  playBtn.className = 'play-btn playing';
+
+  audio.src = STREAM_URL + '?t=' + Date.now();
+  audio.volume = document.getElementById('vol').value / 100;
+  audio.load();
+
+  audio.oncanplay = () => {
+    audio.play().then(() => {
+      dot.className = 'status-dot';
+      badge.textContent = 'LIVE';
+      statStatus.textContent = 'LIVE';
+      statStatus.className = 'stat-val green';
+      noSignal.style.display = 'none';
+      startViz();
+      startTime = Date.now();
+      uptimeInterval = setInterval(updateUptime, 1000);
+    }).catch(stopStream);
+  };
+
+  audio.onerror = () => {
+    stopStream();
+    badge.textContent = 'ERROR';
+    statStatus.textContent = 'ERROR';
+    statStatus.style.color = '#f85149';
+  };
+}
+
+function stopStream() {
+  playing = false;
+  audio.pause();
+  audio.removeAttribute('src');
+  audio.load();
+  playIcon.innerHTML = '<polygon points="5,3 19,12 5,21"/>';
+  playBtn.className = 'play-btn';
+  dot.className = 'status-dot off';
+  badge.textContent = 'OFFLINE';
+  statStatus.textContent = 'IDLE';
+  statStatus.className = 'stat-val';
+  statStatus.style.color = '#484f58';
+  noSignal.style.display = 'flex';
+  cancelAnimationFrame(animFrame);
+  clearInterval(uptimeInterval);
+  startTime = null;
+  statUptime.textContent = '00:00:00';
+  statPeak.textContent = '---';
+  statPeak.style.color = '#484f58';
+  const canvas = document.getElementById('viz');
+  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function startViz() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    source = audioCtx.createMediaElementSource(audio);
+    source.connect(analyser);
+    analyser.connect(audioCtx.destination);
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  drawViz();
+}
+
+function drawViz() {
+  const canvas = document.getElementById('viz');
+  canvas.width = canvas.offsetWidth;
+  canvas.height = canvas.offsetHeight;
+  const ctx = canvas.getContext('2d');
+  const buf = new Uint8Array(analyser.frequencyBinCount);
+
+  function frame() {
+    animFrame = requestAnimationFrame(frame);
+    analyser.getByteFrequencyData(buf);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const barW = Math.floor(canvas.width / buf.length * 2.5);
+    const gap = 2;
+    const count = Math.floor(canvas.width / (barW + gap));
+    let max = 0;
+    for (let i = 0; i < count; i++) {
+      const v = buf[i] / 255;
+      if (v > max) max = v;
+      const h = Math.max(2, v * canvas.height);
+      const x = i * (barW + gap);
+      const y = canvas.height - h;
+      const green = Math.floor(80 + v * 120);
+      ctx.fillStyle = v > 0.85 ? '#f85149' : v > 0.6 ? '#d29922' : 'rgb(30,' + green + ',60)';
+      ctx.fillRect(x, y, barW, h);
+    }
+    const db = max > 0 ? Math.round(20 * Math.log10(max)) : -60;
+    statPeak.textContent = db + ' dB';
+    statPeak.style.color = db > -6 ? '#f85149' : db > -18 ? '#d29922' : '#3fb950';
+  }
+  frame();
+}
+
+function updateUptime() {
+  if (!startTime) return;
+  const s = Math.floor((Date.now() - startTime) / 1000);
+  const h = String(Math.floor(s / 3600)).padStart(2, '0');
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const sec = String(s % 60).padStart(2, '0');
+  statUptime.textContent = h + ':' + m + ':' + sec;
+}
+
+setInterval(() => {
+  const n = new Date();
+  document.getElementById('clock').textContent =
+    String(n.getHours()).padStart(2, '0') + ':' +
+    String(n.getMinutes()).padStart(2, '0') + ':' +
+    String(n.getSeconds()).padStart(2, '0');
+}, 1000);
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+*.wav
+*.mp3
+recordings/
+icecast.xml
+.env
+*.local

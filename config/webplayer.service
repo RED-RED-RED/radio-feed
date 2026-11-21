@@ -1,0 +1,13 @@
+[Unit]
+Description=Radio Web Player
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 -m http.server 8080
+WorkingDirectory=/home/YOUR_USER/webplayer
+Restart=always
+RestartSec=5
+User=YOUR_USER
+
+[Install]
+WantedBy=multi-user.target
