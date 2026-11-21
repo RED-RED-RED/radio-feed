@@ -4,11 +4,11 @@ After=network.target icecast2.service sound.target
 Requires=icecast2.service
 
 [Service]
-ExecStartPre=/bin/sleep 10
 ExecStart=/usr/bin/darkice -c /etc/darkice.cfg
 Restart=always
 RestartSec=5
-User=root
+User=darkice
+SupplementaryGroups=audio
 
 [Install]
 WantedBy=multi-user.target

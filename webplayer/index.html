@@ -14,6 +14,7 @@
   .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; box-shadow: 0 0 6px #3fb950; flex-shrink: 0; }
   .status-dot.off { background: #f85149; box-shadow: 0 0 6px #f85149; }
   .status-dot.connecting { background: #d29922; box-shadow: 0 0 6px #d29922; }
+  .status-dot.idle { background: #58a6ff; box-shadow: 0 0 6px #58a6ff; }
   .viz-area { background: #010409; border-radius: 8px; border: 1px solid #21262d; height: 120px; margin-bottom: 16px; position: relative; overflow: hidden; }
   canvas { width: 100%; height: 100%; display: block; }
   .no-signal { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #484f58; letter-spacing: 0.15em; }
@@ -34,7 +35,9 @@
   .stat-val { font-size: 14px; color: #e6edf3; font-weight: 500; }
   .stat-val.green { color: #3fb950; }
   .stat-val.amber { color: #d29922; }
-  .status-bar { display: flex; align-items: center; gap: 8px; font-size: 10px; color: #484f58; letter-spacing: 0.08em; border-top: 1px solid #21262d; padding-top: 12px; }
+  .stat-val.red { color: #f85149; }
+  .stat-val.dim { color: #484f58; }
+  .status-bar { display: flex; align-items: center; gap: 12px; font-size: 10px; color: #484f58; letter-spacing: 0.08em; border-top: 1px solid #21262d; padding-top: 12px; }
   .stream-url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   audio { display: none; }
 </style>
@@ -45,7 +48,7 @@
     <div class="status-dot off" id="dot"></div>
     <span class="title">RADIO MONITOR</span>
     <span class="badge" id="status-badge">OFFLINE</span>
-    <span class="badge">128 kbps</span>
+    <span class="badge" id="bitrate-badge">--- kbps</span>
   </div>
 
   <div class="viz-area">
@@ -54,7 +57,7 @@
   </div>
 
   <div class="controls">
-    <button class="play-btn" id="play-btn" onclick="togglePlay()">
+    <button class="play-btn" id="play-btn" onclick="togglePlay()" aria-label="Play or stop">
       <svg id="play-icon" viewBox="0 0 24 24"><polygon points="5,3 19,12 5,21"/></svg>
     </button>
     <div class="vol-wrap">
@@ -67,20 +70,21 @@
   <div class="stats">
     <div class="stat">
       <div class="stat-label">STATUS</div>
-      <div class="stat-val" id="stat-status" style="color:#484f58">IDLE</div>
+      <div class="stat-val dim" id="stat-status">IDLE</div>
     </div>
     <div class="stat">
       <div class="stat-label">PEAK LEVEL</div>
-      <div class="stat-val" id="stat-peak" style="color:#484f58">---</div>
+      <div class="stat-val dim" id="stat-peak">---</div>
     </div>
     <div class="stat">
-      <div class="stat-label">UPTIME</div>
-      <div class="stat-val" id="stat-uptime">00:00:00</div>
+      <div class="stat-label">STREAM UP</div>
+      <div class="stat-val dim" id="stat-uptime">--:--:--</div>
     </div>
   </div>
 
   <div class="status-bar">
     <span class="stream-url" id="stream-url"></span>
+    <span id="listeners"></span>
     <span id="clock">--:--:--</span>
   </div>
 </div>
@@ -89,11 +93,18 @@
 
 <script>
 // Uses whatever host you loaded the page from, so a MagicDNS name, a Tailscale IP, etc. all work.
-const STREAM_URL = 'http://' + location.hostname + ':8000/radio';
-let playing = false;
-let audioCtx, analyser, source, animFrame;
-let startTime = null;
-let uptimeInterval = null;
+const HOST = 'http://' + location.hostname + ':8000';
+const STREAM_URL = HOST + '/radio';
+const STATUS_URL = HOST + '/status-json.xsl';
+
+let state = 'idle';          // idle | connecting | live | reconnecting
+let wantPlay = false;
+let retryTimer = null, stallTimer = null, retryDelay = 2000;
+let audioCtx = null, analyser = null, animFrame = null;
+let peakHold = 0;
+let streamUp = null;         // null = unknown, true/false after first status poll
+let streamStart = null;
+let listeners = null;
 
 const audio = document.getElementById('audio');
 const playBtn = document.getElementById('play-btn');
@@ -112,128 +123,200 @@ function setVol(v) {
   document.getElementById('vol-val').textContent = v + '%';
 }
 
+function render() {
+  let dotCls = 'status-dot off', badgeTxt = 'OFFLINE', statTxt = 'IDLE', statCls = 'stat-val dim';
+  if (state === 'live') {
+    dotCls = 'status-dot'; badgeTxt = 'LIVE'; statTxt = 'LIVE'; statCls = 'stat-val green';
+  } else if (state === 'connecting') {
+    dotCls = 'status-dot connecting'; badgeTxt = 'CONNECTING'; statTxt = 'CONNECTING'; statCls = 'stat-val amber';
+  } else if (state === 'reconnecting') {
+    dotCls = 'status-dot connecting'; badgeTxt = 'RECONNECTING'; statTxt = 'RETRYING'; statCls = 'stat-val amber';
+  } else if (streamUp === true) {
+    dotCls = 'status-dot idle'; badgeTxt = 'STREAM UP'; statTxt = 'READY'; statCls = 'stat-val';
+  } else if (streamUp === false) {
+    badgeTxt = 'STREAM DOWN'; statTxt = 'NO STREAM'; statCls = 'stat-val red';
+  }
+  dot.className = dotCls;
+  badge.textContent = badgeTxt;
+  statStatus.textContent = statTxt;
+  statStatus.className = statCls;
+  playBtn.className = wantPlay ? 'play-btn playing' : 'play-btn';
+  playIcon.innerHTML = wantPlay
+    ? '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>'
+    : '<polygon points="5,3 19,12 5,21"/>';
+  noSignal.style.display = state === 'live' ? 'none' : 'flex';
+}
+
 function togglePlay() {
-  if (!playing) startStream(); else stopStream();
+  if (!wantPlay) startStream(); else stopStream();
 }
 
-function startStream() {
-  playing = true;
-  dot.className = 'status-dot connecting';
-  badge.textContent = 'CONNECTING';
-  statStatus.textContent = 'CONNECTING';
-  statStatus.className = 'stat-val amber';
-  playIcon.innerHTML = '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>';
-  playBtn.className = 'play-btn playing';
-
-  audio.src = STREAM_URL + '?t=' + Date.now();
-  audio.volume = document.getElementById('vol').value / 100;
-  audio.load();
-
-  audio.oncanplay = () => {
-    audio.play().then(() => {
-      dot.className = 'status-dot';
-      badge.textContent = 'LIVE';
-      statStatus.textContent = 'LIVE';
-      statStatus.className = 'stat-val green';
-      noSignal.style.display = 'none';
-      startViz();
-      startTime = Date.now();
-      uptimeInterval = setInterval(updateUptime, 1000);
-    }).catch(stopStream);
-  };
-
-  audio.onerror = () => {
-    stopStream();
-    badge.textContent = 'ERROR';
-    statStatus.textContent = 'ERROR';
-    statStatus.style.color = '#f85149';
-  };
-}
-
-function stopStream() {
-  playing = false;
-  audio.pause();
-  audio.removeAttribute('src');
-  audio.load();
-  playIcon.innerHTML = '<polygon points="5,3 19,12 5,21"/>';
-  playBtn.className = 'play-btn';
-  dot.className = 'status-dot off';
-  badge.textContent = 'OFFLINE';
-  statStatus.textContent = 'IDLE';
-  statStatus.className = 'stat-val';
-  statStatus.style.color = '#484f58';
-  noSignal.style.display = 'flex';
-  cancelAnimationFrame(animFrame);
-  clearInterval(uptimeInterval);
-  startTime = null;
-  statUptime.textContent = '00:00:00';
-  statPeak.textContent = '---';
-  statPeak.style.color = '#484f58';
-  const canvas = document.getElementById('viz');
-  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
-}
-
-function startViz() {
+function initAudio() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
-    source = audioCtx.createMediaElementSource(audio);
-    source.connect(analyser);
+    const src = audioCtx.createMediaElementSource(audio);
+    src.connect(analyser);
     analyser.connect(audioCtx.destination);
   }
   if (audioCtx.state === 'suspended') audioCtx.resume();
-  drawViz();
 }
 
-function drawViz() {
+function loadStream() {
+  if (!wantPlay) return;
+  audio.src = STREAM_URL + '?t=' + Date.now();
+  audio.play().catch(() => {});
+}
+
+function scheduleRetry() {
+  if (!wantPlay) return;
+  clearTimeout(stallTimer);
+  clearTimeout(retryTimer);
+  state = 'reconnecting';
+  render();
+  retryTimer = setTimeout(loadStream, retryDelay);
+  retryDelay = Math.min(retryDelay * 2, 30000);
+}
+
+function startStream() {
+  wantPlay = true;
+  retryDelay = 2000;
+  state = 'connecting';
+  render();
+  initAudio();
+  audio.volume = document.getElementById('vol').value / 100;
+  loadStream();
+  startViz();
+}
+
+function stopStream() {
+  wantPlay = false;
+  clearTimeout(retryTimer);
+  clearTimeout(stallTimer);
+  audio.pause();
+  audio.removeAttribute('src');
+  audio.load();
+  state = 'idle';
+  if (animFrame) cancelAnimationFrame(animFrame);
+  animFrame = null;
+  peakHold = 0;
+  statPeak.textContent = '---';
+  statPeak.className = 'stat-val dim';
+  const canvas = document.getElementById('viz');
+  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+  render();
+}
+
+// Registered once, so a rebuffer can never stack up extra loops or timers.
+audio.addEventListener('playing', () => {
+  clearTimeout(stallTimer);
+  retryDelay = 2000;
+  state = 'live';
+  render();
+});
+audio.addEventListener('waiting', () => {
+  if (!wantPlay) return;
+  clearTimeout(stallTimer);
+  stallTimer = setTimeout(scheduleRetry, 15000);
+});
+audio.addEventListener('error', () => { if (wantPlay) scheduleRetry(); });
+audio.addEventListener('ended', () => { if (wantPlay) scheduleRetry(); });
+
+function startViz() {
+  if (animFrame) return;
   const canvas = document.getElementById('viz');
   canvas.width = canvas.offsetWidth;
   canvas.height = canvas.offsetHeight;
   const ctx = canvas.getContext('2d');
-  const buf = new Uint8Array(analyser.frequencyBinCount);
+  const freq = new Uint8Array(analyser.frequencyBinCount);
+  const wave = new Uint8Array(analyser.fftSize);
 
   function frame() {
     animFrame = requestAnimationFrame(frame);
-    analyser.getByteFrequencyData(buf);
+
+    analyser.getByteFrequencyData(freq);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const barW = Math.floor(canvas.width / buf.length * 2.5);
+    const barW = Math.floor(canvas.width / freq.length * 2.5);
     const gap = 2;
     const count = Math.floor(canvas.width / (barW + gap));
-    let max = 0;
     for (let i = 0; i < count; i++) {
-      const v = buf[i] / 255;
-      if (v > max) max = v;
+      const v = freq[i] / 255;
       const h = Math.max(2, v * canvas.height);
       const x = i * (barW + gap);
-      const y = canvas.height - h;
       const green = Math.floor(80 + v * 120);
       ctx.fillStyle = v > 0.85 ? '#f85149' : v > 0.6 ? '#d29922' : 'rgb(30,' + green + ',60)';
-      ctx.fillRect(x, y, barW, h);
+      ctx.fillRect(x, canvas.height - h, barW, h);
     }
-    const db = max > 0 ? Math.round(20 * Math.log10(max)) : -60;
-    statPeak.textContent = db + ' dB';
-    statPeak.style.color = db > -6 ? '#f85149' : db > -18 ? '#d29922' : '#3fb950';
+
+    // True signal peak from the waveform, with a slow decay so it is readable.
+    analyser.getByteTimeDomainData(wave);
+    let p = 0;
+    for (let i = 0; i < wave.length; i++) {
+      const a = Math.abs(wave[i] - 128) / 128;
+      if (a > p) p = a;
+    }
+    peakHold = Math.max(p, peakHold * 0.92);
+    if (peakHold > 0.008) {
+      const db = Math.round(20 * Math.log10(peakHold));
+      statPeak.textContent = db + ' dB';
+      statPeak.className = 'stat-val ' + (db > -6 ? 'red' : db > -18 ? 'amber' : 'green');
+    } else {
+      statPeak.textContent = '---';
+      statPeak.className = 'stat-val dim';
+    }
   }
   frame();
 }
 
-function updateUptime() {
-  if (!startTime) return;
-  const s = Math.floor((Date.now() - startTime) / 1000);
-  const h = String(Math.floor(s / 3600)).padStart(2, '0');
-  const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
-  const sec = String(s % 60).padStart(2, '0');
-  statUptime.textContent = h + ':' + m + ':' + sec;
+async function pollStatus() {
+  try {
+    const r = await fetch(STATUS_URL, { cache: 'no-store' });
+    const j = await r.json();
+    let src = j.icestats && j.icestats.source;
+    if (Array.isArray(src)) {
+      src = src.find(s => /\/radio$/.test(s.listenurl || '')) || src[0];
+    }
+    if (src) {
+      streamUp = true;
+      streamStart = Date.parse(src.stream_start_iso8601 || '') || null;
+      listeners = src.listeners;
+      const kbps = src.bitrate || (src.audio_bitrate ? Math.round(src.audio_bitrate / 1000) : null);
+      document.getElementById('bitrate-badge').textContent = (kbps ? kbps : '---') + ' kbps';
+    } else {
+      streamUp = false;
+      streamStart = null;
+      listeners = null;
+    }
+  } catch (e) {
+    streamUp = false;
+    streamStart = null;
+    listeners = null;
+  }
+  document.getElementById('listeners').textContent =
+    listeners === null ? '' : listeners + (listeners === 1 ? ' listener' : ' listeners');
+  render();
 }
 
-setInterval(() => {
+function pad(n) { return String(n).padStart(2, '0'); }
+
+function tick() {
   const n = new Date();
-  document.getElementById('clock').textContent =
-    String(n.getHours()).padStart(2, '0') + ':' +
-    String(n.getMinutes()).padStart(2, '0') + ':' +
-    String(n.getSeconds()).padStart(2, '0');
-}, 1000);
+  document.getElementById('clock').textContent = pad(n.getHours()) + ':' + pad(n.getMinutes()) + ':' + pad(n.getSeconds());
+  if (streamStart) {
+    const s = Math.max(0, Math.floor((Date.now() - streamStart) / 1000));
+    statUptime.textContent = pad(Math.floor(s / 3600)) + ':' + pad(Math.floor((s % 3600) / 60)) + ':' + pad(s % 60);
+    statUptime.className = 'stat-val';
+  } else {
+    statUptime.textContent = '--:--:--';
+    statUptime.className = 'stat-val dim';
+  }
+}
+
+render();
+setInterval(tick, 1000);
+pollStatus();
+setInterval(pollStatus, 10000);
 </script>
 </body>
 </html>

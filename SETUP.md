@@ -71,12 +71,16 @@ Example output:
 card 1: Device [USB Audio Device], device 0: USB Audio [USB Audio]
 ```
 
-That is `hw:1,0`. Note that the card number can change between reboots when USB devices enumerate in a different order. Re-check after a reboot if the stream stops. See Troubleshooting.
+The number can change between reboots when USB devices enumerate in a different order, so use the card **name** instead. Here the name is `Device`, which gives:
+
+```
+hw:CARD=Device,DEV=0
+```
 
 Test capture:
 
 ```bash
-arecord -D hw:1,0 -f cd -t wav -d 5 test.wav && aplay test.wav
+arecord -D hw:CARD=Device,DEV=0 -f cd -t wav -d 5 test.wav && aplay test.wav
 ```
 
 ## Step 5: Install Icecast2 and Darkice
@@ -104,11 +108,14 @@ sudo nano /etc/darkice.cfg
 
 Use the template in `config/darkice.cfg`. Things that matter:
 
-- Keep values bare. **Do not put comments at the end of a line.** Darkice's parser can treat them as part of the value.
+- Put comments on their own line. Keep values bare, with nothing after them.
 - Use `server = 127.0.0.1`, not `localhost`. `localhost` can resolve to IPv6 first and Icecast is not listening there.
 - `password` must match the Icecast source password exactly.
-- `device` must match the card number from Step 4.
+- `device` must match the card name from Step 4.
 - Some sound cards only support stereo capture. If you get `can't set channels`, keep `channel = 2`.
+- `realtime = no` is there because Darkice will run as a normal user in Step 8.
+
+Darkice reads the Icecast password from this file, so lock it down once the service user exists (Step 8).
 
 ## Step 7: Start Icecast2
 
@@ -120,6 +127,15 @@ ss -tlnp | grep 8000
 
 Leave Icecast listening on all interfaces and restrict access with the firewall in Step 11. Binding it to the Tailscale IP in `icecast.xml` fails at boot because Icecast starts before Tailscale is up.
 
+This box only needs a couple of listeners. In `/etc/icecast2/icecast.xml`, under `<limits>`, lower the defaults:
+
+```xml
+<clients>5</clients>
+<sources>1</sources>
+```
+
+Then `sudo systemctl restart icecast2`.
+
 Test Darkice by hand first:
 
 ```bash
@@ -130,6 +146,14 @@ It should run with no errors. Press Ctrl+C when done.
 
 ## Step 8: Darkice systemd service
 
+Darkice does not need root. Create a service user in the `audio` group and let it read the config:
+
+```bash
+sudo useradd -r -G audio -s /usr/sbin/nologin darkice
+sudo chown root:darkice /etc/darkice.cfg
+sudo chmod 640 /etc/darkice.cfg
+```
+
 Copy `config/darkice.service` to `/etc/systemd/system/darkice.service`, then:
 
 ```bash
@@ -139,7 +163,7 @@ sudo systemctl start darkice
 sudo systemctl status icecast2 darkice
 ```
 
-The unit has a 10 second pre-start delay so the USB sound card has time to show up after boot.
+If the USB card is not ready when the service first starts, Darkice exits and systemd retries every 5 seconds until it is.
 
 ## Step 9: Listen
 
@@ -200,7 +224,8 @@ If the signal is distorted, check that the radio is going into **line in** and n
 | Darkice `TcpSocket connect error [111]` | Icecast is not running or not reachable. Check `ss -tlnp \| grep 8000`. Use `127.0.0.1` in `server =`. |
 | Darkice `can't open connector [0]` | Usually the audio device. Run `arecord -l` and make sure `device =` matches the current card number. |
 | Darkice `can't set channels` | The card does not support that channel count. Use `channel = 2`. |
-| Works until reboot, then stops | The USB card number changed. Re-check `arecord -l` and update `device =`. |
+| Works until reboot, then stops | You are probably using a card number. Switch `device =` to the card name (`hw:CARD=<name>,DEV=0`). |
+| Darkice fails to start as the `darkice` user | Check `journalctl -u darkice`. Confirm the user is in the `audio` group and can read `/etc/darkice.cfg`. |
 | Stream URL gives 404 | Darkice has not connected to Icecast yet. Check `journalctl -u darkice -f`. |
 | Silent or very quiet audio | Raise capture gain in `alsamixer`. |
 | Distorted audio | Lower capture gain, use line in rather than mic in. |
