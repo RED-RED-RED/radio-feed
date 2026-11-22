@@ -3,6 +3,8 @@ Private audio streaming box on a Raspberry Pi. USB sound card to Icecast, reacha
 
 USB sound card -> Darkice -> Icecast2 -> Tailscale -> browser.
 
+![Radio Monitor web player](docs/player.png)
+
 ## Before deploying
 
 - Replace `CHANGE_ME` in `config/darkice.cfg` with your Icecast source password. Never commit the real one.
